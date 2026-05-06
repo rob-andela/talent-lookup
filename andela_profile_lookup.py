@@ -214,13 +214,19 @@ def search_email(page, email: str) -> list[dict]:
 def verify_status(page, url: str) -> str:
     """Navigate to a profile and return its detect_status() label."""
     page.goto(url, wait_until="domcontentloaded")  # Much faster than networkidle
-    # Wait for the page body to be ready instead of hard sleep
+    # Wait for the page content to be ready
     try:
+        # Wait for body content, then poll for status text to appear
         page.wait_for_selector('body', timeout=2000, state='attached')
-        # Brief wait for any dynamic content
-        page.wait_for_timeout(500)
+        # Poll up to 2s for certification status text to appear
+        for _ in range(20):
+            flags = page.evaluate(STATUS_REGEX_JS)
+            if flags:
+                return detect_status(flags)
+            page.wait_for_timeout(100)  # 100ms polling interval
     except Exception:
         pass
+    # Final check
     flags = page.evaluate(STATUS_REGEX_JS)
     return detect_status(flags)
 
@@ -303,12 +309,9 @@ def lookup(input_path: str, output_path: str) -> None:
         for i, (name, email) in enumerate(rows, start=1):
             print(f"[{i}/{len(rows)}] {name} <{email}> ...", end=" ", flush=True)
 
-            # 1. Open/reopen the search overlay.
-            # Only navigate back to jobs page on first iteration or if we're on a profile page
+            # 1. Open the search overlay (return to jobs page first).
             try:
-                current_url = page.url
-                if i == 1 or "/talent/" in current_url:
-                    page.goto(ATC_URL, wait_until="domcontentloaded")
+                page.goto(ATC_URL, wait_until="domcontentloaded")
                 open_search_overlay(page)
             except Exception as e:
                 print(f"ERROR opening search: {e}")

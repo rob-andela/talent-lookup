@@ -25,25 +25,53 @@
     ];
     // ----------------------------------
 
-    const SEARCH_DEBOUNCE_MS = 2000;
-    const PROFILE_LOAD_MS = 3500;
+    const SEARCH_POLL_TIMEOUT_MS = 3000;  // Max time to wait for search results
+    const PROFILE_POLL_TIMEOUT_MS = 2000;  // Max time to wait for status text
+    const POLL_INTERVAL_MS = 100;          // Check every 100ms
+    const SEARCH_DEBOUNCE_MS = 2000;       // Wait for server-side search to respond
 
     const setSearchValue = (value) => {
         const input = document.querySelector('input[placeholder*="Search"]');
         if (!input) throw new Error('Search input not visible. Open the search overlay first.');
         input.focus();
+        // Clear previous value first
         const setter = Object.getOwnPropertyDescriptor(
             window.HTMLInputElement.prototype, 'value'
         ).set;
+        setter.call(input, '');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        // Set new value
         setter.call(input, value);
         input.dispatchEvent(new Event('input', { bubbles: true }));
     };
 
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+    const pollUntil = async (checkFn, timeoutMs, intervalMs = 100) => {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const result = checkFn();
+            if (result) return result;
+            await wait(intervalMs);
+        }
+        return checkFn(); // Final check
+    };
+
     const extractLinks = () =>
         Array.from(document.querySelectorAll('a[href^="/talent/"]'))
             .map((a) => ({ href: a.href, text: a.textContent.trim() }));
+
+    const waitForSearchResults = async () => {
+        // Poll until we get results or timeout
+        return await pollUntil(
+            () => {
+                const links = extractLinks();
+                return links.length > 0 ? links : null;
+            },
+            SEARCH_POLL_TIMEOUT_MS,
+            POLL_INTERVAL_MS
+        );
+    };
 
     const detectStatus = (text) => {
         if (/Talent is in progress of being certified/i.test(text))
@@ -64,9 +92,24 @@
         frame.src = url;
         document.body.appendChild(frame);
         try {
+            // Wait for iframe to load
             await new Promise((res) =>
-                frame.addEventListener('load', () => setTimeout(res, PROFILE_LOAD_MS), { once: true })
+                frame.addEventListener('load', res, { once: true })
             );
+            // Poll for status text to appear (faster than fixed 3.5s wait)
+            const status = await pollUntil(
+                () => {
+                    const text = frame.contentDocument?.body?.innerText || '';
+                    const detected = detectStatus(text);
+                    // Return if we found a definitive status (not "unknown")
+                    if (detected !== 'Status unknown') return detected;
+                    return null;
+                },
+                PROFILE_POLL_TIMEOUT_MS,
+                POLL_INTERVAL_MS
+            );
+            // If still unknown, return the final check
+            if (status) return status;
             const text = frame.contentDocument?.body?.innerText || '';
             return detectStatus(text);
         } finally {
@@ -82,9 +125,9 @@
         const idx = i + 1;
         try {
             setSearchValue(email);
-            await wait(SEARCH_DEBOUNCE_MS);
-            const links = extractLinks();
-            if (!links.length) {
+            await wait(SEARCH_DEBOUNCE_MS); // Wait for server-side search
+            const links = await waitForSearchResults();
+            if (!links || !links.length) {
                 rows.push([idx, name, email, 'NOT FOUND', 'No matches in ATC search']);
                 console.log(`[${idx}/${EMAILS.length}] ${name}: not found`);
                 continue;
