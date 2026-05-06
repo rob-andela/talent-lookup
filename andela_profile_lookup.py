@@ -63,7 +63,6 @@ from __future__ import annotations
 
 import csv
 import sys
-import time
 from pathlib import Path
 
 try:
@@ -85,7 +84,8 @@ USER_DATA_DIR = Path.home() / ".andela_lookup_chrome_profile"
 # and dispatches the React-compatible input event.
 SET_SEARCH_VALUE_JS = """
 (value) => {
-    const input = document.querySelector('input[placeholder*="Search"]');
+    const input = document.querySelector('input[placeholder*="Search talent"]') || 
+                  document.querySelector('input[placeholder*="Search"]');
     if (!input) return false;
     input.focus();
     const setter = Object.getOwnPropertyDescriptor(
@@ -133,41 +133,94 @@ def detect_status(flags: list[str]) -> str:
 
 def open_search_overlay(page) -> None:
     """Click the magnifying-glass button in the left sidebar."""
-    # The sidebar has roughly 5-6 icon buttons; the search one is at the
-    # bottom of the icon stack. Anchor on the SearchIcon SVG.
+    # Check if search is already open
+    try:
+        if page.locator('input[placeholder*="Search talent"]').is_visible(timeout=500):
+            # Search already open, just clear it
+            page.evaluate("""
+                () => {
+                    const input = document.querySelector('input[placeholder*="Search talent"]');
+                    if (input) {
+                        input.value = '';
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }
+            """)
+            return
+    except Exception:
+        pass
+    
+    # Wait for the sidebar search button to render (React app needs time)
+    try:
+        page.wait_for_selector('svg[data-testid="SearchOutlinedIcon"]', timeout=5000)
+    except Exception:
+        try:
+            page.wait_for_selector('[class*="actionsContainer"] button', timeout=3000)
+        except Exception:
+            pass
+    
+    # Target the search button specifically
     candidates = [
-        'button:has(svg[data-testid="SearchIcon"])',
-        '[aria-label="Search"]',
-        'a:has(svg[data-testid="SearchIcon"])',
+        'button:has(svg[data-testid="SearchOutlinedIcon"])',
+        'div.styles_actionIcon__Y1fTF:has(svg[data-testid="SearchOutlinedIcon"])',
+        '[class*="actionIcon"]:has(svg[data-testid="SearchOutlinedIcon"])',
+        '.styles_actionsContainer__UMaN5 button:last-child',
+        '[class*="actionsContainer"] button:last-child',
     ]
+    
+    last_error = None
     for sel in candidates:
         try:
-            page.locator(sel).first.click(timeout=2000)
-            page.wait_for_selector('input[placeholder*="Search"]', timeout=3000)
+            element = page.locator(sel).first
+            element.click(timeout=2000)
+            # Wait for the specific search input to appear
+            page.wait_for_selector('input[placeholder*="Search talent"]', timeout=3000)
             return
-        except Exception:
+        except Exception as e:
+            last_error = e
             continue
+    
+    # Fallback: find all buttons and click the last one
+    try:
+        buttons = page.locator('[class*="actionsContainer"] button').all()
+        if buttons and len(buttons) > 0:
+            buttons[-1].click(timeout=2000)
+            page.wait_for_selector('input[placeholder*="Search talent"]', timeout=3000)
+            return
+    except Exception as e:
+        last_error = e
+    
     raise RuntimeError(
-        "Could not locate the search button on the sidebar. The ATC UI "
-        "may have changed - update open_search_overlay() in this script."
+        f"Could not locate the search button. Last error: {last_error}"
     )
 
 
 def search_email(page, email: str) -> list[dict]:
     """Type the email into the open search overlay and return matching links."""
     page.evaluate(SET_SEARCH_VALUE_JS, email)
-    time.sleep(2)  # Wait for debounced server-side search
+    # Wait for search results to appear by polling for link changes
+    # This is faster than a fixed 2s sleep since most searches return in <1s
+    try:
+        # Wait for at least one result link to appear, or timeout after 3s
+        page.wait_for_selector('a[href^="/talent/"]', timeout=3000, state='attached')
+        # Give it a brief moment for all results to load
+        page.wait_for_timeout(300)
+    except Exception:
+        # No results found or timeout - return empty
+        pass
     return page.evaluate(EXTRACT_LINKS_JS) or []
 
 
 def verify_status(page, url: str) -> str:
     """Navigate to a profile and return its detect_status() label."""
-    page.goto(url)
+    page.goto(url, wait_until="domcontentloaded")  # Much faster than networkidle
+    # Wait for the page body to be ready instead of hard sleep
     try:
-        page.wait_for_load_state("networkidle", timeout=10000)
-    except PWTimeout:
+        page.wait_for_selector('body', timeout=2000, state='attached')
+        # Brief wait for any dynamic content
+        page.wait_for_timeout(500)
+    except Exception:
         pass
-    time.sleep(1)  # let the cert banner render
     flags = page.evaluate(STATUS_REGEX_JS)
     return detect_status(flags)
 
@@ -212,10 +265,19 @@ def lookup(input_path: str, output_path: str) -> None:
         writer.writerow(["#", "Name", "Email", "Andela Profile URL", "Status"])
         out_fp.flush()
 
+        # Try to use Chrome first, fall back to bundled Chromium if not available
+        browser_channel = None
+        try:
+            test_ctx = p.chromium.launch(headless=True, channel="chrome")
+            test_ctx.close()
+            browser_channel = "chrome"
+        except Exception:
+            browser_channel = None  # Use bundled Chromium
+        
         ctx = p.chromium.launch_persistent_context(
             str(USER_DATA_DIR),
             headless=False,
-            channel="chrome",
+            channel=browser_channel,
             viewport={"width": 1400, "height": 900},
         )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -225,20 +287,28 @@ def lookup(input_path: str, output_path: str) -> None:
             "If a login page appears, sign in with your @andela.com Google "
             "account. The script will continue once the Jobs Dashboard loads."
         )
+        print(f"Current URL: {page.url}")
         try:
-            page.wait_for_url("**/jobs", timeout=300_000)  # 5 min
+            page.wait_for_url("**/jobs*", timeout=300_000)  # 5 min
         except PWTimeout:
-            print("Login timed out after 5 minutes. Exiting.")
+            print(f"Login timed out after 5 minutes. Current URL: {page.url}")
             ctx.close()
             return
-        page.wait_for_load_state("networkidle", timeout=10_000)
+        print(f"Authenticated! URL: {page.url}")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        except PWTimeout:
+            pass  # page is loaded enough
 
         for i, (name, email) in enumerate(rows, start=1):
             print(f"[{i}/{len(rows)}] {name} <{email}> ...", end=" ", flush=True)
 
-            # 1. Open the search overlay (closes after every navigation).
+            # 1. Open/reopen the search overlay.
+            # Only navigate back to jobs page on first iteration or if we're on a profile page
             try:
-                page.goto(ATC_URL, wait_until="domcontentloaded")
+                current_url = page.url
+                if i == 1 or "/talent/" in current_url:
+                    page.goto(ATC_URL, wait_until="domcontentloaded")
                 open_search_overlay(page)
             except Exception as e:
                 print(f"ERROR opening search: {e}")

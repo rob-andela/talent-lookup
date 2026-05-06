@@ -51,12 +51,10 @@ if ! python -c "import playwright" 2>/dev/null; then
   pip install --quiet playwright
 fi
 
-# Make sure Chromium is downloaded for Playwright.
-if ! python -c "
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    p.chromium.launch(channel='chrome').close()
-" 2>/dev/null; then
+# Make sure Chromium is downloaded for Playwright (Chrome fallback handled by script).
+# Check if playwright browsers are installed by looking for the browsers directory
+PLAYWRIGHT_BROWSERS="$HOME/.cache/ms-playwright"
+if [[ ! -d "$PLAYWRIGHT_BROWSERS" ]] || [[ -z "$(ls -A "$PLAYWRIGHT_BROWSERS" 2>/dev/null)" ]]; then
   echo "Downloading Chromium for Playwright (one time, ~150 MB) ..."
   python -m playwright install chromium
 fi
